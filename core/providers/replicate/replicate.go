@@ -122,7 +122,9 @@ func createPrediction(
 	}
 	providerUtils.SetExtraHeaders(ctx, req, headersToUse, nil)
 
-	req.SetBody(jsonBody)
+	if !providerUtils.ApplyLargePayloadRequestBodyWithModelNormalization(ctx, req, schemas.Replicate) {
+		req.SetBody(jsonBody)
+	}
 
 	// Make request
 	latency, bifrostErr := providerUtils.MakeRequestWithContext(ctx, client, req, resp)
