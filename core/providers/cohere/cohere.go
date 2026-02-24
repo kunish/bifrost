@@ -155,7 +155,12 @@ func (provider *CohereProvider) completeRequest(ctx *schemas.BifrostContext, jso
 	req := fasthttp.AcquireRequest()
 	resp := fasthttp.AcquireResponse()
 	defer fasthttp.ReleaseRequest(req)
-	defer fasthttp.ReleaseResponse(resp)
+	respOwned := true
+	defer func() {
+		if respOwned {
+			fasthttp.ReleaseResponse(resp)
+		}
+	}()
 
 	// Set any extra headers from network config
 	providerUtils.SetExtraHeaders(ctx, req, provider.networkConfig.ExtraHeaders, nil)
@@ -167,10 +172,17 @@ func (provider *CohereProvider) completeRequest(ctx *schemas.BifrostContext, jso
 		req.Header.Set("Authorization", "Bearer "+key)
 	}
 
-	req.SetBody(jsonData)
+	usedLargePayloadBody := providerUtils.ApplyLargePayloadRequestBodyWithModelNormalization(ctx, req, schemas.Cohere)
+	if !usedLargePayloadBody {
+		req.SetBody(jsonData)
+	}
 
-	// Send the request
-	latency, bifrostErr := providerUtils.MakeRequestWithContext(ctx, provider.client, req, resp)
+	// Send the request with optional large response streaming
+	activeClient := providerUtils.PrepareResponseStreaming(ctx, provider.client, resp)
+	latency, bifrostErr := providerUtils.MakeRequestWithContext(ctx, activeClient, req, resp)
+	if usedLargePayloadBody {
+		providerUtils.DrainLargePayloadRemainder(ctx)
+	}
 	if bifrostErr != nil {
 		return nil, latency, nil, bifrostErr
 	}
@@ -180,19 +192,20 @@ func (provider *CohereProvider) completeRequest(ctx *schemas.BifrostContext, jso
 
 	// Handle error response
 	if resp.StatusCode() != fasthttp.StatusOK {
+		providerUtils.MaterializeStreamErrorBody(ctx, resp)
 		return nil, latency, providerResponseHeaders, parseCohereError(resp, meta)
 	}
 
-	body, err := providerUtils.CheckAndDecodeBody(resp)
-	if err != nil {
-		return nil, latency, providerResponseHeaders, providerUtils.NewBifrostOperationError(schemas.ErrProviderResponseDecode, err, provider.GetProviderKey())
+	body, isLargeResp, decodeErr := providerUtils.FinalizeResponseWithLargeDetection(ctx, resp, provider.GetProviderKey(), provider.logger)
+	if decodeErr != nil {
+		return nil, latency, providerResponseHeaders, decodeErr
+	}
+	if isLargeResp {
+		respOwned = false
+		return nil, latency, providerResponseHeaders, nil
 	}
 
-	// Read the response body and copy it before releasing the response
-	// to avoid use-after-free since resp.Body() references fasthttp's internal buffer
-	bodyCopy := append([]byte(nil), body...)
-
-	return bodyCopy, latency, providerResponseHeaders, nil
+	return body, latency, providerResponseHeaders, nil
 }
 
 // listModelsByKey performs a list models request for a single key.
@@ -350,6 +363,19 @@ func (provider *CohereProvider) ChatCompletion(ctx *schemas.BifrostContext, key 
 		return nil, providerUtils.EnrichError(ctx, err, jsonBody, nil, provider.sendBackRawRequest, provider.sendBackRawResponse)
 	}
 
+	// Large response mode: return lightweight response with metadata only
+	if isLargeResp, _ := ctx.Value(schemas.BifrostContextKeyLargeResponseMode).(bool); isLargeResp {
+		return &schemas.BifrostChatResponse{
+			Model: request.Model,
+			ExtraFields: schemas.BifrostResponseExtraFields{
+				Provider:       provider.GetProviderKey(),
+				ModelRequested: request.Model,
+				RequestType:    schemas.ChatCompletionRequest,
+				Latency:        latency.Milliseconds(),
+			},
+		}, nil
+	}
+
 	// Create response object from pool
 	response := acquireCohereResponse()
 	defer releaseCohereResponse(response)
@@ -429,10 +455,16 @@ func (provider *CohereProvider) ChatCompletionStream(ctx *schemas.BifrostContext
 	req.Header.Set("Accept", "text/event-stream")
 	req.Header.Set("Cache-Control", "no-cache")
 
-	req.SetBody(jsonBody)
+	usedLargePayloadBody := providerUtils.ApplyLargePayloadRequestBodyWithModelNormalization(ctx, req, schemas.Cohere)
+	if !usedLargePayloadBody {
+		req.SetBody(jsonBody)
+	}
 
 	// Make the request
 	err := provider.client.Do(req, resp)
+	if usedLargePayloadBody {
+		providerUtils.DrainLargePayloadRemainder(ctx)
+	}
 	if err != nil {
 		defer providerUtils.ReleaseStreamingResponse(resp)
 		if errors.Is(err, context.Canceled) {
@@ -616,6 +648,19 @@ func (provider *CohereProvider) Responses(ctx *schemas.BifrostContext, key schem
 		return nil, providerUtils.EnrichError(ctx, err, jsonBody, nil, provider.sendBackRawRequest, provider.sendBackRawResponse)
 	}
 
+	// Large response mode: return lightweight response with metadata only
+	if isLargeResp, _ := ctx.Value(schemas.BifrostContextKeyLargeResponseMode).(bool); isLargeResp {
+		return &schemas.BifrostResponsesResponse{
+			Model: request.Model,
+			ExtraFields: schemas.BifrostResponseExtraFields{
+				Provider:       provider.GetProviderKey(),
+				ModelRequested: request.Model,
+				RequestType:    schemas.ResponsesRequest,
+				Latency:        latency.Milliseconds(),
+			},
+		}, nil
+	}
+
 	// Create response object from pool
 	response := acquireCohereResponse()
 	defer releaseCohereResponse(response)
@@ -696,10 +741,16 @@ func (provider *CohereProvider) ResponsesStream(ctx *schemas.BifrostContext, pos
 	req.Header.Set("Accept", "text/event-stream")
 	req.Header.Set("Cache-Control", "no-cache")
 
-	req.SetBody(jsonBody)
+	usedLargePayloadBody := providerUtils.ApplyLargePayloadRequestBodyWithModelNormalization(ctx, req, schemas.Cohere)
+	if !usedLargePayloadBody {
+		req.SetBody(jsonBody)
+	}
 
 	// Make the request
 	err := provider.client.Do(req, resp)
+	if usedLargePayloadBody {
+		providerUtils.DrainLargePayloadRemainder(ctx)
+	}
 	if err != nil {
 		defer providerUtils.ReleaseStreamingResponse(resp)
 		if errors.Is(err, context.Canceled) {
@@ -904,6 +955,19 @@ func (provider *CohereProvider) Embedding(ctx *schemas.BifrostContext, key schem
 		return nil, providerUtils.EnrichError(ctx, err, jsonBody, nil, provider.sendBackRawRequest, provider.sendBackRawResponse)
 	}
 
+	// Large response mode: return lightweight response with metadata only
+	if isLargeResp, _ := ctx.Value(schemas.BifrostContextKeyLargeResponseMode).(bool); isLargeResp {
+		return &schemas.BifrostEmbeddingResponse{
+			Model: request.Model,
+			ExtraFields: schemas.BifrostResponseExtraFields{
+				Provider:       provider.GetProviderKey(),
+				ModelRequested: request.Model,
+				RequestType:    schemas.EmbeddingRequest,
+				Latency:        latency.Milliseconds(),
+			},
+		}, nil
+	}
+
 	// Create response object from pool
 	response := acquireCohereEmbeddingResponse()
 	defer releaseCohereEmbeddingResponse(response)
@@ -963,6 +1027,19 @@ func (provider *CohereProvider) Rerank(ctx *schemas.BifrostContext, key schemas.
 	}
 	if err != nil {
 		return nil, providerUtils.EnrichError(ctx, err, jsonBody, nil, provider.sendBackRawRequest, provider.sendBackRawResponse)
+	}
+
+	// Large response mode: return lightweight response with metadata only
+	if isLargeResp, _ := ctx.Value(schemas.BifrostContextKeyLargeResponseMode).(bool); isLargeResp {
+		return &schemas.BifrostRerankResponse{
+			Model: request.Model,
+			ExtraFields: schemas.BifrostResponseExtraFields{
+				Provider:       provider.GetProviderKey(),
+				ModelRequested: request.Model,
+				RequestType:    schemas.RerankRequest,
+				Latency:        latency.Milliseconds(),
+			},
+		}, nil
 	}
 
 	// Create response object from pool
@@ -1159,6 +1236,19 @@ func (provider *CohereProvider) CountTokens(ctx *schemas.BifrostContext, key sch
 	}
 	if bifrostErr != nil {
 		return nil, providerUtils.EnrichError(ctx, bifrostErr, jsonBody, nil, provider.sendBackRawRequest, provider.sendBackRawResponse)
+	}
+
+	// Large response mode: return lightweight response with metadata only
+	if isLargeResp, _ := ctx.Value(schemas.BifrostContextKeyLargeResponseMode).(bool); isLargeResp {
+		return &schemas.BifrostCountTokensResponse{
+			Model: request.Model,
+			ExtraFields: schemas.BifrostResponseExtraFields{
+				Provider:       providerName,
+				ModelRequested: request.Model,
+				RequestType:    schemas.CountTokensRequest,
+				Latency:        latency.Milliseconds(),
+			},
+		}, nil
 	}
 
 	cohereResponse := &CohereCountTokensResponse{}
