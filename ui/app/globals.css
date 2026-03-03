@@ -2,6 +2,7 @@
 @import "tw-animate-css";
 
 @source "../app/**/*.tsx";
+@source "../../../bifrost-enterprise/enterprise-ui/app/**/*.tsx";
 
 @custom-variant dark (&:is(.dark *));
 
@@ -226,4 +227,8 @@ div.content-container:has(.no-padding-parent) {
 
 div.content-container main.content-container-inner:has(.no-padding-parent) {
 	@apply !p-0;
+}
+
+div.content-container:has(.no-border-parent) {
+	@apply !border-0;
 }
