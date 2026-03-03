@@ -121,6 +121,7 @@ type BifrostHTTPServer struct {
 
 	AuthMiddleware    *handlers.AuthMiddleware
 	TracingMiddleware *handlers.TracingMiddleware
+	WSTicketStore     *handlers.WSTicketStore
 }
 
 var logger schemas.Logger
@@ -982,7 +983,7 @@ func (s *BifrostHTTPServer) RegisterAPIRoutes(ctx context.Context, callbacks Ser
 	mcpHandler := handlers.NewMCPHandler(callbacks, s.Client, s.Config, oauthHandler)
 	configHandler := handlers.NewConfigHandler(callbacks, s.Config)
 	pluginsHandler := handlers.NewPluginsHandler(callbacks, s.Config.ConfigStore)
-	sessionHandler := handlers.NewSessionHandler(s.Config.ConfigStore)
+	sessionHandler := handlers.NewSessionHandler(s.Config.ConfigStore, s.WSTicketStore)
 	// Going ahead with API handlers
 	healthHandler.RegisterRoutes(s.Router, middlewares...)
 	providerHandler.RegisterRoutes(s.Router, middlewares...)
@@ -1252,7 +1253,8 @@ func (s *BifrostHTTPServer) Bootstrap(ctx context.Context) error {
 	if s.Config.ConfigStore == nil {
 		logger.Error("auth middleware requires config store, skipping auth middleware initialization")
 	} else {
-		s.AuthMiddleware, err = handlers.InitAuthMiddleware(s.Config.ConfigStore)
+		s.WSTicketStore = handlers.NewWSTicketStore()
+		s.AuthMiddleware, err = handlers.InitAuthMiddleware(s.Config.ConfigStore, s.WSTicketStore)
 		if err != nil {
 			return fmt.Errorf("failed to initialize auth middleware: %v", err)
 		}
@@ -1290,7 +1292,7 @@ func (s *BifrostHTTPServer) Bootstrap(ctx context.Context) error {
 	s.RegisterUIRoutes()
 	// Create fasthttp server instance
 	s.Server = &fasthttp.Server{
-		Handler:            handlers.CorsMiddleware(s.Config)(s.Router.Handler),
+		Handler:            handlers.SecurityHeadersMiddleware()(handlers.CorsMiddleware(s.Config)(s.Router.Handler)),
 		MaxRequestBodySize: s.Config.ClientConfig.MaxRequestBodySizeMB * 1024 * 1024,
 		ReadBufferSize:     1024 * 64, // 64kb
 	}

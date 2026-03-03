@@ -101,6 +101,7 @@ func IsOriginAllowed(origin string, allowedOrigins []string) bool {
 		}
 
 		if allowedOrigin == "*" {
+			logger.Warn("CORS wildcard origin '*' is configured — credentials will not be sent. Use explicit origins for cookie-based auth.")
 			return true
 		}
 
